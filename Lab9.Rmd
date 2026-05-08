@@ -1,21 +1,26 @@
 ---
-title: "Lab8"
+title: "Lab9"
 author: "Pedro Avila, Javier Benitez, Brandon Rivera"
-date: "2026-04-18"
+date: "2026-05-08"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 ```
 
 ## Pasaporte
 
-### Preparación de datos
-```{r}
+### Reutilización de los conjuntos de entrenamiento y prueba
+
+Se parte del mismo pipeline de preparación de datos que en las entregas anteriores para garantizar comparaciones válidas entre algoritmos.
+
+```{r preparacion-base}
 library(dplyr)
 library(ggplot2)
 library(caret)
+library(nnet)
+library(neuralnet)
 
 load("datasets/listings.RData")
 
@@ -37,183 +42,405 @@ listings_clean$price_cat <- cut(
   breaks = c(-Inf, q33, q66, Inf),
   labels = c("barata", "media", "cara")
 )
-```
 
-
-1. Use los mismos conjuntos de entrenamiento y prueba de las hojas de trabajo pasadas para probar el algoritmo.
-
-```{r}
 set.seed(42)
 idx   <- createDataPartition(listings_clean$price, p = 0.7, list = FALSE)
 train <- listings_clean[idx, ]
 test  <- listings_clean[-idx, ]
 ```
 
-2. Explore los datos y explique las transformaciones que debe hacerle para generar un modelo de máquinas vectoriales de soporte.
-3. Use como variable respuesta la variable categórica que especifica si la casa es barata, media o cara.
+### Transformaciones para Redes Neuronales
 
-```{r}
-summary(train)
-ggplot(train, aes(x = price)) +
-  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
-  labs(title = "Distribución de precios", x = "Precio", y = "Frecuencia") +
-  theme_minimal()
-ggplot(train, aes(x = price_cat)) +
-  geom_bar(fill = "steelblue", color = "white") +
-  labs(title = "Distribución de categorías de precio", x = "Categoría de precio", y = "Frecuencia") +
-  theme_minimal()
+Las RNA son igual de sensibles a la escala de las variables que las SVM: el gradiente descenso converge más lentamente cuando las variables tienen magnitudes muy distintas. Se aplican las mismas transformaciones de la entrega anterior: logaritmo natural en las variables con sesgo positivo y estandarización z-score (aprendida solo del conjunto de entrenamiento).
+
+```{r transformaciones-rna}
+train_nn <- train
+test_nn  <- test
+
+# Transformación logarítmica en variables con fuerte sesgo positivo
+train_nn$minimum_nights    <- log1p(train_nn$minimum_nights)
+train_nn$number_of_reviews <- log1p(train_nn$number_of_reviews)
+test_nn$minimum_nights     <- log1p(test_nn$minimum_nights)
+test_nn$number_of_reviews  <- log1p(test_nn$number_of_reviews)
+
+# Estandarización z-score: parámetros aprendidos solo del conjunto de entrenamiento
+pre_proc <- preProcess(train_nn[, features], method = c("center", "scale"))
+train_nn[, features] <- predict(pre_proc, train_nn[, features])
+test_nn[, features]  <- predict(pre_proc, test_nn[, features])
+
+train_nn$price_cat <- factor(train_nn$price_cat)
+test_nn$price_cat  <- factor(test_nn$price_cat)
+
+summary(train_nn[, features])
 ```
 
-Las SVM calculan distancias (o productos punto) entre puntos en el espacio de características, por lo que variables con escalas muy distintas distorsionan ese cálculo: `minimum_nights` (rango 1–365) y `number_of_reviews` (rango 1–1592) dominarían sobre `review_scores_rating` (rango 1–5) sin normalización. Además, ambas variables presentan fuerte sesgo positivo (media << máximo), lo que concentra la mayoría de los puntos en valores bajos y genera outliers que dificultan encontrar el hiperplano óptimo. Por ello se aplican dos transformaciones: (1) **logaritmo** en las variables sesgadas para comprimir la cola derecha, y (2) **estandarización z-score** (media 0, desviación 1) en todos los predictores para igualar la influencia de cada variable en el kernel. Las clases (`price_cat`) ya están balanceadas (≈14k observaciones cada una), por lo que no se requiere re-muestreo.
+Tras la transformación todas las variables presentan media ≈ 0 y desviación estándar ≈ 1, condición óptima para el entrenamiento de redes neuronales con descenso de gradiente.
 
-```{r transformaciones-svm}
-train_svm <- train
-test_svm  <- test
+---
 
-train_svm$minimum_nights    <- log1p(train_svm$minimum_nights)
-train_svm$number_of_reviews <- log1p(train_svm$number_of_reviews)
-test_svm$minimum_nights     <- log1p(test_svm$minimum_nights)
-test_svm$number_of_reviews  <- log1p(test_svm$number_of_reviews)
+## Modelos de Clasificación con Redes Neuronales
 
-pre_proc <- preProcess(train_svm[, features], method = c("center", "scale"))
-train_svm[, features] <- predict(pre_proc, train_svm[, features])
-test_svm[, features]  <- predict(pre_proc, test_svm[, features])
+### Distribución de la variable respuesta
 
-train_svm$price_cat <- factor(train_svm$price_cat)
-test_svm$price_cat  <- factor(test_svm$price_cat)
+```{r distribucion-cat}
+cat("Distribución de categorías en entrenamiento:\n")
+print(table(train_nn$price_cat))
 
-summary(train_svm[, features])
+ggplot(train_nn, aes(x = price_cat, fill = price_cat)) +
+  geom_bar(color = "white") +
+  scale_fill_manual(values = c("steelblue", "darkorange", "firebrick")) +
+  labs(title = "Distribución de categorías de precio (entrenamiento)",
+       x = "Categoría", y = "Frecuencia") +
+  theme_minimal() +
+  theme(legend.position = "none")
 ```
 
-Tras la transformación todas las variables tienen media ≈ 0 y desviación estándar ≈ 1, eliminando la ventaja artificial de las variables de mayor magnitud. El parámetro de escala se aprende **solo del conjunto de entrenamiento** y se aplica al de prueba para evitar fuga de información.
+Las tres clases están aproximadamente balanceadas, por lo que no se requiere re-muestreo antes de entrenar las redes.
 
-4. Genere varios (más de 2) modelos de SVM con diferentes kernels y distintos valores en los parámetros c, gamma (circular) y d (en caso de que utilice el polinomial). Puede tunear el modelo de forma automática siempre que explique los resultados
+---
 
-Se entrenan seis modelos usando `e1071::svm()` para tener control explícito sobre cada combinación de kernel y parámetros:
+### Modelo 1 de Clasificación: Red de una capa oculta con activación logística (`nnet`)
 
-- **Lineal**: el hiperplano separador no depende de gamma; solo varía `C` (margen vs. error).
-- **Radial (RBF)**: `C` controla la penalización por error y `gamma` define el radio de influencia de cada punto de soporte; valores altos de gamma producen fronteras más complejas.
-- **Polinomial**: además de `C` y `gamma`, el grado `d` determina la curvatura de la frontera; `d=2` (cuadrático) suele generalizar mejor que `d=3` en datos moderadamente no lineales.
+El primer modelo emplea el paquete `nnet`, que implementa redes *feedforward* de una sola capa oculta con clasificación multiclase mediante softmax en la capa de salida. Se eligen **8 neuronas** en la capa oculta (ligeramente superior al número de entradas) y una regularización L2 con `decay = 0.01` para moderar el sobreajuste.
 
-```{r modelos-svm}
-library(e1071)
+**Topología**: 7 entradas → 8 neuronas ocultas → 3 clases de salida  
+**Función de activación**: logística (sigmoide) en la capa oculta; softmax en la capa de salida.  
+**Parámetros**: `size = 8`, `decay = 0.01`, `maxit = 300`
 
-svm_data  <- train_svm[, c(features, "price_cat")]
-svm_feats <- features
+```{r nnet-clasificacion}
+set.seed(42)
+tiempo_nnet <- system.time({
+  rna_nnet <- nnet(
+    price_cat ~ accommodates + bathrooms + bedrooms + beds +
+                minimum_nights + number_of_reviews + review_scores_rating,
+    data    = train_nn,
+    size    = 8,
+    decay   = 0.01,
+    maxit   = 300,
+    trace   = FALSE
+  )
+})
 
-# Modelo 1: Lineal, C = 0.1
-svm_lin_c01 <- svm(price_cat ~ ., data = svm_data,
-                   kernel = "linear", cost = 0.1)
+cat("Tiempo de entrenamiento – Modelo 1 (nnet):", round(tiempo_nnet["elapsed"], 2), "segundos\n")
+cat("Número total de pesos:", length(rna_nnet$wts), "\n")
+cat("Valor final de la función de pérdida:", round(rna_nnet$value, 4), "\n")
+```
 
-# Modelo 2: Lineal, C = 10
-svm_lin_c10 <- svm(price_cat ~ ., data = svm_data,
-                   kernel = "linear", cost = 10)
+---
 
-# Modelo 3: Radial, C = 1, gamma = 0.1
-svm_rad_c1_g01 <- svm(price_cat ~ ., data = svm_data,
-                      kernel = "radial", cost = 1, gamma = 0.1)
+### Modelo 2 de Clasificación: Red de dos capas ocultas con activación tanh (`neuralnet`)
 
-# Modelo 4: Radial, C = 10, gamma = 0.01
-svm_rad_c10_g001 <- svm(price_cat ~ ., data = svm_data,
-                        kernel = "radial", cost = 10, gamma = 0.01)
+El segundo modelo usa el paquete `neuralnet`, que permite topologías más profundas y funciones de activación configurables. Se emplea la tangente hiperbólica (`tanh`), cuyo rango (−1, 1) y simetría respecto al cero facilitan el aprendizaje cuando los datos están estandarizados, como en este caso. La arquitectura incluye dos capas ocultas de 10 y 5 neuronas.
 
-# Modelo 5: Polinomial, C = 1, grado d = 2, gamma = 0.1
-svm_poly_d2 <- svm(price_cat ~ ., data = svm_data,
-                   kernel = "polynomial", cost = 1, degree = 2, gamma = 0.1)
+Dado que `neuralnet` requiere respuestas numéricas, se aplica *one-hot encoding* a la variable `price_cat`.
 
-# Modelo 6: Polinomial, C = 1, grado d = 3, gamma = 0.1
-svm_poly_d3 <- svm(price_cat ~ ., data = svm_data,
-                   kernel = "polynomial", cost = 1, degree = 3, gamma = 0.1)
+**Topología**: 7 entradas → 10 neuronas → 5 neuronas → 3 salidas  
+**Función de activación**: tanh en capas ocultas; sigmoide implícita en la salida (`linear.output = FALSE`).  
+**Parámetros**: `hidden = c(10, 5)`, `threshold = 0.05`
 
-# Resumen del número de vectores de soporte por modelo
-sv_summary <- data.frame(
-  Modelo  = c("Lineal C=0.1", "Lineal C=10",
-              "Radial C=1 γ=0.1", "Radial C=10 γ=0.01",
-              "Poly d=2", "Poly d=3"),
-  Kernel  = c("linear", "linear", "radial", "radial", "polynomial", "polynomial"),
-  C       = c(0.1, 10, 1, 10, 1, 1),
-  gamma   = c(NA, NA, 0.1, 0.01, 0.1, 0.1),
-  d       = c(NA, NA, NA, NA, 2, 3),
-  SVs     = c(nrow(svm_lin_c01$SV),   nrow(svm_lin_c10$SV),
-              nrow(svm_rad_c1_g01$SV), nrow(svm_rad_c10_g001$SV),
-              nrow(svm_poly_d2$SV),    nrow(svm_poly_d3$SV))
+```{r neuralnet-clasificacion}
+# One-hot encoding de la variable respuesta (model.matrix genera columnas en orden alfabético)
+train_oh     <- model.matrix(~ price_cat - 1, data = train_nn)
+class_names  <- gsub("price_cat", "", colnames(train_oh))   # nombres reales de las clases
+colnames(train_oh) <- class_names
+
+# Data frame para neuralnet: predictores + columnas indicadoras
+train_nn2 <- cbind(train_nn[, features], as.data.frame(train_oh))
+
+formula_nn2 <- as.formula(paste(
+  paste(class_names, collapse = " + "), "~",
+  paste(features, collapse = " + ")
+))
+
+set.seed(42)
+tiempo_neuralnet <- system.time({
+  rna_neuralnet <- neuralnet(
+    formula_nn2,
+    data          = train_nn2,
+    hidden        = c(10, 5),
+    act.fct       = "tanh",
+    linear.output = FALSE,
+    stepmax       = 1e6,
+    threshold     = 0.05
+  )
+})
+
+cat("Tiempo de entrenamiento – Modelo 2 (neuralnet):", round(tiempo_neuralnet["elapsed"], 2), "segundos\n")
+```
+
+```{r plot-red-neuralnet, fig.width=10, fig.height=7}
+# Visualización de la arquitectura de la red
+plot(rna_neuralnet, rep = "best", information = FALSE,
+     main = "Arquitectura – Modelo 2: neuralnet (7→10→5→3, tanh)")
+```
+
+---
+
+### Predicciones y Matrices de Confusión
+
+```{r predicciones-clasificacion}
+# ── Predicciones Modelo 1 (nnet) ──────────────────────────────────────────────
+pred_nnet_class <- factor(
+  predict(rna_nnet, newdata = test_nn[, features], type = "class"),
+  levels = levels(test_nn$price_cat)
 )
-print(sv_summary)
-```
 
-Un `C` bajo (0.1) tolera más errores de clasificación en entrenamiento y produce fronteras más suaves (más vectores de soporte), mientras que `C=10` penaliza fuertemente los errores y ajusta la frontera más a los datos de entrenamiento. Con el kernel radial, `gamma=0.1` crea zonas de influencia más pequeñas (más vectores de soporte, posible sobreajuste) que `gamma=0.01`.
-
-5. Use los modelos para predecir el valor de la variable respuesta
-
-```{r predicciones-svm}
-pred_lin_c01     <- predict(svm_lin_c01,     newdata = test_svm[, svm_feats])
-pred_lin_c10     <- predict(svm_lin_c10,     newdata = test_svm[, svm_feats])
-pred_rad_c1_g01  <- predict(svm_rad_c1_g01,  newdata = test_svm[, svm_feats])
-pred_rad_c10_g001 <- predict(svm_rad_c10_g001, newdata = test_svm[, svm_feats])
-pred_poly_d2     <- predict(svm_poly_d2,     newdata = test_svm[, svm_feats])
-pred_poly_d3     <- predict(svm_poly_d3,     newdata = test_svm[, svm_feats])
-
-# Accuracy rápida en test para comparar los seis modelos
-acc <- function(pred, real) mean(pred == real)
-real <- test_svm$price_cat
-
-acc_summary <- data.frame(
-  Modelo   = sv_summary$Modelo,
-  Accuracy = round(c(acc(pred_lin_c01, real),
-                     acc(pred_lin_c10, real),
-                     acc(pred_rad_c1_g01, real),
-                     acc(pred_rad_c10_g001, real),
-                     acc(pred_poly_d2, real),
-                     acc(pred_poly_d3, real)), 4)
+# ── Predicciones Modelo 2 (neuralnet) ─────────────────────────────────────────
+raw_nn2 <- predict(rna_neuralnet, newdata = test_nn[, features])
+# raw_nn2: matriz con una columna por clase; se toma el argmax
+pred_neuralnet_class <- factor(
+  class_names[apply(raw_nn2, 1, which.max)],
+  levels = levels(test_nn$price_cat)
 )
-print(acc_summary)
 ```
 
-6. Haga las matrices de confusión respectivas.
-7. Analice si los modelos están sobre ajustados o desajustados. ¿Qué puede hacer para manejar el sobreajuste o desajuste?
+```{r cm-clasificacion}
+cat("=== Matriz de confusión – Modelo 1: nnet (7→8→3, logística) ===\n")
+cm_nnet <- confusionMatrix(pred_nnet_class, test_nn$price_cat)
+print(cm_nnet)
 
+cat("\n=== Matriz de confusión – Modelo 2: neuralnet (7→10→5→3, tanh) ===\n")
+cm_nn2 <- confusionMatrix(pred_neuralnet_class, test_nn$price_cat)
+print(cm_nn2)
+```
 
+---
 
+### Comparación de los Modelos de Clasificación con RNA
 
+Se evalúa cada modelo en efectividad (accuracy global y por clase), velocidad de procesamiento y distribución de errores.
 
+```{r comparacion-clasificacion}
+acc <- function(pred, real) round(mean(pred == real), 4)
 
+# Accuracy en entrenamiento para detectar sobreajuste
+pred_nnet_train <- factor(
+  predict(rna_nnet, newdata = train_nn[, features], type = "class"),
+  levels = levels(train_nn$price_cat)
+)
 
+raw_nn2_train <- predict(rna_neuralnet, newdata = train_nn[, features])
+pred_neuralnet_train <- factor(
+  class_names[apply(raw_nn2_train, 1, which.max)],
+  levels = levels(train_nn$price_cat)
+)
 
+comp_class <- data.frame(
+  Modelo        = c("nnet (7→8→3, logística)", "neuralnet (7→10→5→3, tanh)"),
+  Capas_ocultas = c("1 (8 nodos)", "2 (10 y 5 nodos)"),
+  Activacion    = c("logística", "tanh"),
+  Acc_Train     = c(acc(pred_nnet_train, train_nn$price_cat),
+                    acc(pred_neuralnet_train, train_nn$price_cat)),
+  Acc_Test      = c(acc(pred_nnet_class, test_nn$price_cat),
+                    acc(pred_neuralnet_class, test_nn$price_cat)),
+  Tiempo_seg    = c(round(tiempo_nnet["elapsed"], 2),
+                    round(tiempo_neuralnet["elapsed"], 2))
+)
+comp_class$Brecha <- round(comp_class$Acc_Train - comp_class$Acc_Test, 4)
+print(comp_class)
+```
 
+```{r analisis-errores-clase}
+# Tasa de error por clase en cada modelo
+err_por_clase <- function(cm, nombres) {
+  t <- cm$table
+  n_real    <- rowSums(t)
+  n_correct <- diag(t)
+  tasa_err  <- round((n_real - n_correct) / n_real, 4)
+  data.frame(Clase = nombres, Tasa_error = tasa_err)
+}
 
+clases <- levels(test_nn$price_cat)
+cat("Tasa de error por clase – Modelo 1 (nnet):\n")
+print(err_por_clase(cm_nnet, clases))
 
+cat("\nTasa de error por clase – Modelo 2 (neuralnet):\n")
+print(err_por_clase(cm_nn2, clases))
+```
 
+La clase con mayor tasa de error en ambos modelos es típicamente "media", ya que sus límites de precio se superponen parcialmente con las otras dos categorías. Los errores en la clase "cara" son los de mayor impacto para SmartStay, pues una clasificación incorrecta llevaría a recomendar propiedades por encima del presupuesto del cliente corporativo.
 
+```{r visualizacion-comparacion}
+# Gráfico de accuracy en entrenamiento vs prueba
+comp_long <- tidyr::pivot_longer(
+  comp_class[, c("Modelo", "Acc_Train", "Acc_Test")],
+  cols = c("Acc_Train", "Acc_Test"),
+  names_to = "Conjunto", values_to = "Accuracy"
+)
 
+ggplot(comp_long, aes(x = Modelo, y = Accuracy, fill = Conjunto)) +
+  geom_bar(stat = "identity", position = "dodge", color = "white") +
+  scale_fill_manual(values = c("steelblue", "darkorange"),
+                    labels = c("Entrenamiento", "Prueba")) +
+  labs(title = "Accuracy: entrenamiento vs. prueba por modelo RNA (clasificación)",
+       x = NULL, y = "Accuracy", fill = NULL) +
+  theme_minimal() +
+  coord_flip()
+```
 
+---
 
+### Análisis de Sobreajuste en los Modelos de Clasificación
 
+```{r sobreajuste-clasificacion}
+cat("Resumen de brechas train/test:\n")
+print(comp_class[, c("Modelo", "Acc_Train", "Acc_Test", "Brecha")])
+```
 
+Una brecha menor a 0.03 indica buena generalización. Si algún modelo supera 0.05, se recomienda: (1) aumentar `decay` para incrementar la regularización L2, (2) reducir el número de neuronas en las capas ocultas, o (3) aplicar *early stopping* monitoreando la pérdida en un conjunto de validación. La estandarización previa ya actúa como primera barrera contra el sobreajuste.
 
+---
 
+### Tuneo del Mejor Modelo de Clasificación
 
+Se selecciona el modelo con mayor accuracy en el conjunto de prueba y se tunean sus hiperparámetros mediante validación cruzada de 5 pliegues con `caret::train()`. La búsqueda explora combinaciones de `size` (neuronas en la capa oculta) y `decay` (regularización L2).
 
+```{r tuneo-clasificacion}
+set.seed(42)
 
+tune_grid <- expand.grid(
+  size  = c(5, 8, 12, 16),
+  decay = c(0.001, 0.01, 0.05, 0.1)
+)
 
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = multiClassSummary,
+  verboseIter     = FALSE
+)
 
+train_caret <- train_nn[, c(features, "price_cat")]
 
+tiempo_tuneo <- system.time({
+  rna_tuneado <- train(
+    price_cat ~ .,
+    data     = train_caret,
+    method   = "nnet",
+    tuneGrid = tune_grid,
+    trControl = ctrl,
+    trace    = FALSE,
+    MaxNWts  = 3000,
+    maxit    = 300
+  )
+})
 
+cat("Mejor combinación de hiperparámetros:\n")
+print(rna_tuneado$bestTune)
+cat("Tiempo de tuneo:", round(tiempo_tuneo["elapsed"], 2), "segundos\n")
 
+# Curva de tuneo
+plot(rna_tuneado, main = "Tuneo de hiperparámetros – nnet (CV 5-fold)")
 
+# Evaluación del modelo tuneado en el conjunto de prueba
+pred_tuneado <- predict(rna_tuneado, newdata = test_nn[, features])
+cm_tuneado   <- confusionMatrix(pred_tuneado, test_nn$price_cat)
 
+cat("\n=== Matriz de confusión – Modelo tuneado ===\n")
+print(cm_tuneado)
 
+acc_pre_tuneo  <- max(comp_class$Acc_Test)
+acc_post_tuneo <- round(cm_tuneado$overall["Accuracy"], 4)
 
+cat("\nAccuracy pre-tuneo  (mejor modelo):", acc_pre_tuneo, "\n")
+cat("Accuracy post-tuneo (modelo tuneado):", acc_post_tuneo, "\n")
+cat("Mejora:", round(acc_post_tuneo - acc_pre_tuneo, 4), "\n")
+```
 
+El proceso de búsqueda en cuadrícula con 5 pliegues evalúa 16 combinaciones de hiperparámetros de forma honesta (sin contaminar el conjunto de prueba). El modelo seleccionado equilibra complejidad y regularización. Si la mejora post-tuneo es marginal (< 0.005), el modelo original ya había alcanzado un plateau y aumentar la complejidad solo añadiría riesgo de sobreajuste.
 
+---
 
+## Modelos de Regresión con Redes Neuronales
 
+### Preparación de datos para Regresión
 
+Para predecir el precio como variable continua, la variable respuesta también debe escalarse. Se guardan los parámetros de escala del conjunto de entrenamiento para invertir la transformación al momento de calcular métricas en la escala original (dólares).
 
+```{r preparacion-regresion}
+# Escalar el precio con los parámetros del conjunto de entrenamiento
+price_mean <- mean(train_nn$price)
+price_sd   <- sd(train_nn$price)
 
+train_reg <- train_nn
+test_reg  <- test_nn
 
+train_reg$price_scaled <- (train_reg$price - price_mean) / price_sd
+test_reg$price_scaled  <- (test_reg$price  - price_mean) / price_sd
 
+cat("Parámetros de escala del precio:\n")
+cat("  Media (entrenamiento):", round(price_mean, 2), "USD\n")
+cat("  Desv. estándar:       ", round(price_sd, 2),   "USD\n")
+cat("  Rango escalado [train]:",
+    round(range(train_reg$price_scaled), 4), "\n")
+```
 
+---
 
+### Modelo 1 de Regresión: Una capa oculta con activación logística (`nnet`)
 
+Se usa `nnet` con `linout = TRUE`, que activa una capa de salida lineal adecuada para regresión. La capa oculta conserva la activación logística.
 
+**Topología**: 7 entradas → 10 neuronas ocultas → 1 salida (precio escalado)  
+**Función de activación**: logística en la capa oculta; lineal en la salida.  
+**Parámetros**: `size = 10`, `decay = 0.01`, `maxit = 300`, `linout = TRUE`
 
+```{r nnet-regresion}
+set.seed(42)
+tiempo_nnet_reg <- system.time({
+  rna_nnet_reg <- nnet(
+    price_scaled ~ accommodates + bathrooms + bedrooms + beds +
+                   minimum_nights + number_of_reviews + review_scores_rating,
+    data   = train_reg,
+    size   = 10,
+    decay  = 0.01,
+    linout = TRUE,    # salida lineal para regresión
+    maxit  = 300,
+    trace  = FALSE
+  )
+})
+
+cat("Tiempo de entrenamiento – Modelo 1 de regresión (nnet):",
+    round(tiempo_nnet_reg["elapsed"], 2), "segundos\n")
+cat("Número de pesos:", length(rna_nnet_reg$wts), "\n")
+```
+
+---
+
+### Modelo 2 de Regresión: Dos capas ocultas con activación tanh (`neuralnet`)
+
+Se usa `neuralnet` con `linear.output = TRUE` para que la capa de salida no aplique ninguna función de activación, permitiendo predicciones en cualquier rango continuo.
+
+**Topología**: 7 entradas → 12 neuronas → 6 neuronas → 1 salida (precio escalado)  
+**Función de activación**: tanh en capas ocultas; lineal en la salida.  
+**Parámetros**: `hidden = c(12, 6)`, `threshold = 0.05`, `linear.output = TRUE`
+
+```{r neuralnet-regresion}
+formula_reg   <- as.formula(paste("price_scaled ~", paste(features, collapse = " + ")))
+train_reg2    <- train_reg[, c(features, "price_scaled")]
+
+set.seed(42)
+tiempo_neuralnet_reg <- system.time({
+  rna_neuralnet_reg <- neuralnet(
+    formula_reg,
+    data          = train_reg2,
+    hidden        = c(12, 6),
+    act.fct       = "tanh",
+    linear.output = TRUE,
+    stepmax       = 1e6,
+    threshold     = 0.05
+  )
+})
+
+cat("Tiempo de entrenamiento – Modelo 2 de regresión (neuralnet):",
+    round(tiempo_neuralnet_reg["elapsed"], 2), "segundos\n")
+```
+
+```{r plot-red-regresion, fig.width=10, fig.height=7}
+plot(rna_neuralnet_reg, rep = "best", information = FALSE,
+     main = "Arquitectura – Modelo 2 regresión: neuralnet (7→12→6→1, tanh)")
+```
+
+El Modelo 1 (`nnet`) privilegia la velocidad con una arquitectura más compacta, mientras que el Modelo 2 (`neuralnet`) incorpora mayor profundidad para capturar relaciones no lineales más complejas entre las características y el precio. La función tanh, por su simetría alrededor del cero, es especialmente conveniente cuando las entradas están estandarizadas, como es el caso tras el preprocesamiento aplicado.
+```
