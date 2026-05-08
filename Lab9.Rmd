@@ -1,0 +1,219 @@
+---
+title: "Lab8"
+author: "Pedro Avila, Javier Benitez, Brandon Rivera"
+date: "2026-04-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Pasaporte
+
+### Preparación de datos
+```{r}
+library(dplyr)
+library(ggplot2)
+library(caret)
+
+load("datasets/listings.RData")
+
+listings$price <- as.numeric(gsub("[$,]", "", listings$price))
+listings <- listings |> filter(!is.na(price), price > 0, price < 1000)
+
+features <- c("accommodates", "bathrooms", "bedrooms", "beds",
+              "minimum_nights", "number_of_reviews", "review_scores_rating")
+
+listings_clean <- listings |>
+  select(all_of(features), price) |>
+  na.omit()
+
+q33 <- quantile(listings_clean$price, 0.33)
+q66 <- quantile(listings_clean$price, 0.66)
+
+listings_clean$price_cat <- cut(
+  listings_clean$price,
+  breaks = c(-Inf, q33, q66, Inf),
+  labels = c("barata", "media", "cara")
+)
+```
+
+
+1. Use los mismos conjuntos de entrenamiento y prueba de las hojas de trabajo pasadas para probar el algoritmo.
+
+```{r}
+set.seed(42)
+idx   <- createDataPartition(listings_clean$price, p = 0.7, list = FALSE)
+train <- listings_clean[idx, ]
+test  <- listings_clean[-idx, ]
+```
+
+2. Explore los datos y explique las transformaciones que debe hacerle para generar un modelo de máquinas vectoriales de soporte.
+3. Use como variable respuesta la variable categórica que especifica si la casa es barata, media o cara.
+
+```{r}
+summary(train)
+ggplot(train, aes(x = price)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Distribución de precios", x = "Precio", y = "Frecuencia") +
+  theme_minimal()
+ggplot(train, aes(x = price_cat)) +
+  geom_bar(fill = "steelblue", color = "white") +
+  labs(title = "Distribución de categorías de precio", x = "Categoría de precio", y = "Frecuencia") +
+  theme_minimal()
+```
+
+Las SVM calculan distancias (o productos punto) entre puntos en el espacio de características, por lo que variables con escalas muy distintas distorsionan ese cálculo: `minimum_nights` (rango 1–365) y `number_of_reviews` (rango 1–1592) dominarían sobre `review_scores_rating` (rango 1–5) sin normalización. Además, ambas variables presentan fuerte sesgo positivo (media << máximo), lo que concentra la mayoría de los puntos en valores bajos y genera outliers que dificultan encontrar el hiperplano óptimo. Por ello se aplican dos transformaciones: (1) **logaritmo** en las variables sesgadas para comprimir la cola derecha, y (2) **estandarización z-score** (media 0, desviación 1) en todos los predictores para igualar la influencia de cada variable en el kernel. Las clases (`price_cat`) ya están balanceadas (≈14k observaciones cada una), por lo que no se requiere re-muestreo.
+
+```{r transformaciones-svm}
+train_svm <- train
+test_svm  <- test
+
+train_svm$minimum_nights    <- log1p(train_svm$minimum_nights)
+train_svm$number_of_reviews <- log1p(train_svm$number_of_reviews)
+test_svm$minimum_nights     <- log1p(test_svm$minimum_nights)
+test_svm$number_of_reviews  <- log1p(test_svm$number_of_reviews)
+
+pre_proc <- preProcess(train_svm[, features], method = c("center", "scale"))
+train_svm[, features] <- predict(pre_proc, train_svm[, features])
+test_svm[, features]  <- predict(pre_proc, test_svm[, features])
+
+train_svm$price_cat <- factor(train_svm$price_cat)
+test_svm$price_cat  <- factor(test_svm$price_cat)
+
+summary(train_svm[, features])
+```
+
+Tras la transformación todas las variables tienen media ≈ 0 y desviación estándar ≈ 1, eliminando la ventaja artificial de las variables de mayor magnitud. El parámetro de escala se aprende **solo del conjunto de entrenamiento** y se aplica al de prueba para evitar fuga de información.
+
+4. Genere varios (más de 2) modelos de SVM con diferentes kernels y distintos valores en los parámetros c, gamma (circular) y d (en caso de que utilice el polinomial). Puede tunear el modelo de forma automática siempre que explique los resultados
+
+Se entrenan seis modelos usando `e1071::svm()` para tener control explícito sobre cada combinación de kernel y parámetros:
+
+- **Lineal**: el hiperplano separador no depende de gamma; solo varía `C` (margen vs. error).
+- **Radial (RBF)**: `C` controla la penalización por error y `gamma` define el radio de influencia de cada punto de soporte; valores altos de gamma producen fronteras más complejas.
+- **Polinomial**: además de `C` y `gamma`, el grado `d` determina la curvatura de la frontera; `d=2` (cuadrático) suele generalizar mejor que `d=3` en datos moderadamente no lineales.
+
+```{r modelos-svm}
+library(e1071)
+
+svm_data  <- train_svm[, c(features, "price_cat")]
+svm_feats <- features
+
+# Modelo 1: Lineal, C = 0.1
+svm_lin_c01 <- svm(price_cat ~ ., data = svm_data,
+                   kernel = "linear", cost = 0.1)
+
+# Modelo 2: Lineal, C = 10
+svm_lin_c10 <- svm(price_cat ~ ., data = svm_data,
+                   kernel = "linear", cost = 10)
+
+# Modelo 3: Radial, C = 1, gamma = 0.1
+svm_rad_c1_g01 <- svm(price_cat ~ ., data = svm_data,
+                      kernel = "radial", cost = 1, gamma = 0.1)
+
+# Modelo 4: Radial, C = 10, gamma = 0.01
+svm_rad_c10_g001 <- svm(price_cat ~ ., data = svm_data,
+                        kernel = "radial", cost = 10, gamma = 0.01)
+
+# Modelo 5: Polinomial, C = 1, grado d = 2, gamma = 0.1
+svm_poly_d2 <- svm(price_cat ~ ., data = svm_data,
+                   kernel = "polynomial", cost = 1, degree = 2, gamma = 0.1)
+
+# Modelo 6: Polinomial, C = 1, grado d = 3, gamma = 0.1
+svm_poly_d3 <- svm(price_cat ~ ., data = svm_data,
+                   kernel = "polynomial", cost = 1, degree = 3, gamma = 0.1)
+
+# Resumen del número de vectores de soporte por modelo
+sv_summary <- data.frame(
+  Modelo  = c("Lineal C=0.1", "Lineal C=10",
+              "Radial C=1 γ=0.1", "Radial C=10 γ=0.01",
+              "Poly d=2", "Poly d=3"),
+  Kernel  = c("linear", "linear", "radial", "radial", "polynomial", "polynomial"),
+  C       = c(0.1, 10, 1, 10, 1, 1),
+  gamma   = c(NA, NA, 0.1, 0.01, 0.1, 0.1),
+  d       = c(NA, NA, NA, NA, 2, 3),
+  SVs     = c(nrow(svm_lin_c01$SV),   nrow(svm_lin_c10$SV),
+              nrow(svm_rad_c1_g01$SV), nrow(svm_rad_c10_g001$SV),
+              nrow(svm_poly_d2$SV),    nrow(svm_poly_d3$SV))
+)
+print(sv_summary)
+```
+
+Un `C` bajo (0.1) tolera más errores de clasificación en entrenamiento y produce fronteras más suaves (más vectores de soporte), mientras que `C=10` penaliza fuertemente los errores y ajusta la frontera más a los datos de entrenamiento. Con el kernel radial, `gamma=0.1` crea zonas de influencia más pequeñas (más vectores de soporte, posible sobreajuste) que `gamma=0.01`.
+
+5. Use los modelos para predecir el valor de la variable respuesta
+
+```{r predicciones-svm}
+pred_lin_c01     <- predict(svm_lin_c01,     newdata = test_svm[, svm_feats])
+pred_lin_c10     <- predict(svm_lin_c10,     newdata = test_svm[, svm_feats])
+pred_rad_c1_g01  <- predict(svm_rad_c1_g01,  newdata = test_svm[, svm_feats])
+pred_rad_c10_g001 <- predict(svm_rad_c10_g001, newdata = test_svm[, svm_feats])
+pred_poly_d2     <- predict(svm_poly_d2,     newdata = test_svm[, svm_feats])
+pred_poly_d3     <- predict(svm_poly_d3,     newdata = test_svm[, svm_feats])
+
+# Accuracy rápida en test para comparar los seis modelos
+acc <- function(pred, real) mean(pred == real)
+real <- test_svm$price_cat
+
+acc_summary <- data.frame(
+  Modelo   = sv_summary$Modelo,
+  Accuracy = round(c(acc(pred_lin_c01, real),
+                     acc(pred_lin_c10, real),
+                     acc(pred_rad_c1_g01, real),
+                     acc(pred_rad_c10_g001, real),
+                     acc(pred_poly_d2, real),
+                     acc(pred_poly_d3, real)), 4)
+)
+print(acc_summary)
+```
+
+6. Haga las matrices de confusión respectivas.
+7. Analice si los modelos están sobre ajustados o desajustados. ¿Qué puede hacer para manejar el sobreajuste o desajuste?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
